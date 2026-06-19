@@ -129,6 +129,14 @@ async def sync_klines(session: aiohttp.ClientSession, interval: str, target_dict
             target_dict[sym] = df
         await asyncio.sleep(0.2) # Respetamos rate limit de Binance inicial
 
+async def resync_all(session: aiohttp.ClientSession, pairs_list: list = None):
+    """Backfill completo de los 3 timeframes. Se llama al arrancar y en CADA
+    reconexión del WebSocket para que no queden huecos de velas si el WS se cayó."""
+    pairs_list = pairs_list if pairs_list is not None else state.pairs
+    await sync_klines(session, '1h', state.klines_1h, pairs_list)
+    await sync_klines(session, '15m', state.klines_15m, pairs_list)
+    await sync_klines(session, '5m', state.klines_5m, pairs_list)
+
 # ==========================================
 # ANÁLISIS DE MICROESTRUCTURA (ORDER BOOK)
 # ==========================================
@@ -300,16 +308,23 @@ async def ws_multiplex_listener(session: aiohttp.ClientSession):
     while True:
         try:
             state.activity_msg = "[Conectando WebSockets Maestros...]"
-            async with session.ws_connect(BASE_WS_URL) as ws:
-                state.ws_connection = ws  
+            async with session.ws_connect(BASE_WS_URL, heartbeat=30) as ws:
+                state.ws_connection = ws
+
+                # Backfill ANTES de procesar ticks: garantiza que tras una caída
+                # las series se rellenen y no queden huecos en RSI/Bandas.
+                state.activity_msg = "[Re-sincronizando histórico tras conexión...]"
+                await resync_all(session)
+
                 state.activity_msg = "[Procesando Flujo de Datos HFT (Ticks)]"
-                
+
                 # Suscribimos 1h, 15m y 5m por chunks para no sobrecargar el payload
                 streams = []
                 for sym in state.pairs:
                     s = sym.lower()
                     streams.extend([f"{s}@kline_1h", f"{s}@kline_15m", f"{s}@kline_5m"])
-                
+
+                # 0.25s entre mensajes: bajo el límite de 5 msgs/seg de control de Binance
                 for i in range(0, len(streams), 50):
                     payload = {
                         "method": "SUBSCRIBE",
@@ -317,7 +332,7 @@ async def ws_multiplex_listener(session: aiohttp.ClientSession):
                         "id": i
                     }
                     await ws.send_json(payload)
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.25)
 
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
@@ -370,6 +385,21 @@ async def ws_multiplex_listener(session: aiohttp.ClientSession):
         except Exception as e:
             state.activity_msg = f"[Reconectando WebSocket: {str(e)}]"
             await asyncio.sleep(2)
+
+async def periodic_pairs_updater(session: aiohttp.ClientSession):
+    """Refresca el universo de pares (top por volumen) cada 15 min. Si cambió,
+    fuerza un reconnect: el WS re-sincroniza y re-suscribe con la lista nueva."""
+    while True:
+        await asyncio.sleep(900)
+        old_pairs = set(state.pairs)
+        try:
+            await initialize_pairs(session)
+        except Exception:
+            continue
+        if set(state.pairs) != old_pairs:
+            state.activity_msg = "[Universo de pares actualizado. Reconectando WS...]"
+            if state.ws_connection and not state.ws_connection.closed:
+                await state.ws_connection.close()  # dispara reconnect + resync + resub
 
 # ==========================================
 # INTERFAZ GRÁFICA (RICH UI)
@@ -456,12 +486,12 @@ async def main():
     connector = aiohttp.TCPConnector(limit=50) # Límite sano de sockets
     async with aiohttp.ClientSession(connector=connector) as session:
         await initialize_pairs(session)
-        await sync_klines(session, '1h', state.klines_1h, state.pairs)
-        await sync_klines(session, '15m', state.klines_15m, state.pairs)
-        await sync_klines(session, '5m', state.klines_5m, state.pairs)
-        
+        # El backfill de velas lo hace el WS en cada conexión (resync_all),
+        # por eso no duplicamos la sincronización acá.
+
         ws_task = asyncio.create_task(ws_multiplex_listener(session))
-        
+        pairs_task = asyncio.create_task(periodic_pairs_updater(session))
+
         with Live(generate_ui(), refresh_per_second=4, screen=True) as live:
             while True:
                 await asyncio.sleep(0.25)
