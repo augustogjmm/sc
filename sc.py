@@ -17,7 +17,7 @@ from rich import box
 # CONFIGURACIÓN GLOBAL Y CONSTANTES
 # ==========================================
 BASE_REST_URL = "https://api.binance.com"
-BASE_WS_URL = "wss://stream.binance.com:9443/stream?streams="
+BASE_WS_URL = "wss://stream.binance.com:9443/ws" # Endpoint WS crudo para subscripciones
 TOP_N_PAIRS = 200
 RSI_PERIOD = 14
 BB_PERIOD = 20
@@ -36,6 +36,7 @@ class ScannerState:
         
         self.radar = {} 
         self.active_signals = {}
+        self.last_eval = {} # Throttle para no ahogar el event loop
         
         self.ws_connection = None 
         self.activity_msg = "Iniciando sistema..."
@@ -45,22 +46,17 @@ class ScannerState:
 state = ScannerState()
 
 # ==========================================
-# MOTOR MATEMÁTICO (TradingView Exact Match)
+# MOTOR MATEMÁTICO (Vectorizado y Optimizado)
 # ==========================================
-def rma_tradingview(series: pd.Series, period: int) -> pd.Series:
-    alpha = 1 / period
-    rma = series.copy()
-    rma.iloc[period] = series.iloc[1:period+1].mean()
-    for i in range(period+1, len(series)):
-        rma.iloc[i] = alpha * series.iloc[i] + (1 - alpha) * rma.iloc[i-1]
-    return rma
-
 def calculate_rsi(series: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
+    """RSI Vectorizado: Extremadamente rápido, no ahoga la CPU."""
     delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -1 * delta.clip(upper=0)
-    avg_gain = rma_tradingview(gain, period)
-    avg_loss = rma_tradingview(loss, period)
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
     return rsi
@@ -73,7 +69,7 @@ def calculate_bollinger_bands(series: pd.Series, period: int = BB_PERIOD, std_de
     return sma, upper_bb, lower_bb
 
 def get_indicators(df: pd.DataFrame):
-    """Retorna las SERIES COMPLETAS para evaluación de la vela actual y anteriores."""
+    """Calcula indicadores. Retorna series completas limitadas a 150 para optimizar."""
     if len(df) < max(BB_PERIOD, 50): 
         return None, None, None
     rsi = calculate_rsi(df['close'])
@@ -90,9 +86,8 @@ async def fetch_json(session: aiohttp.ClientSession, url: str, params: dict = No
         return await response.json()
 
 async def initialize_pairs(session: aiohttp.ClientSession):
-    state.activity_msg = "[Recopilando Exchange Info y Top Pares...]"
+    state.activity_msg = "[Recopilando Exchange Info y Top Pares por Volumen...]"
     
-    # 1. Obtener Exchange Info para tick sizes (precisión) validando solo pares USDT
     exch_info = await fetch_json(session, f"{BASE_REST_URL}/api/v3/exchangeInfo")
     valid_binance_pairs = {}
     for symbol_data in exch_info['symbols']:
@@ -104,52 +99,27 @@ async def initialize_pairs(session: aiohttp.ClientSession):
                     decimals = max(0, int(round(-math.log10(tick_size))))
                     valid_binance_pairs[sym] = {'tick': tick_size, 'decimals': decimals}
 
-    selected_pairs = []
+    # Utilizamos exclusivamente volumen Binance para evitar colisiones y límites de CoinGecko
+    tickers = await fetch_json(session, f"{BASE_REST_URL}/api/v3/ticker/24hr")
+    vol_pairs = [{'symbol': t['symbol'], 'vol': float(t['quoteVolume'])} for t in tickers if t['symbol'] in valid_binance_pairs]
+    vol_pairs.sort(key=lambda x: x['vol'], reverse=True)
     
-    # 2. Prioridad 1: Top Global por Capitalización de Mercado (API CoinGecko Pública)
-    # Esto asegura que los pares sean fuertes y existan en Binance, OKX, Bybit, etc.
-    state.activity_msg = "[Consultando Market Cap Global (CoinGecko)...]"
-    try:
-        cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1"
-        async with session.get(cg_url) as resp:
-            if resp.status == 200:
-                cg_data = await resp.json()
-                for coin in cg_data:
-                    sym = f"{coin['symbol'].upper()}USDT"
-                    if sym in valid_binance_pairs and sym not in selected_pairs:
-                        selected_pairs.append(sym)
-    except Exception:
-        pass # Fallback silencioso si el servidor rechaza la conexión
-        
-    # 3. Prioridad 2 / Fallback: Completar con Top por Volumen 24h
-    state.activity_msg = "[Completando Top con Volumen 24h...]"
-    if len(selected_pairs) < TOP_N_PAIRS:
-        tickers = await fetch_json(session, f"{BASE_REST_URL}/api/v3/ticker/24hr")
-        vol_pairs = [{'symbol': t['symbol'], 'vol': float(t['quoteVolume'])} for t in tickers if t['symbol'] in valid_binance_pairs]
-        vol_pairs.sort(key=lambda x: x['vol'], reverse=True)
-        
-        for p in vol_pairs:
-            if p['symbol'] not in selected_pairs:
-                selected_pairs.append(p['symbol'])
-            if len(selected_pairs) >= TOP_N_PAIRS:
-                break
-
-    # Asignar pares finales y limpiar estado de precisiones en memoria
-    state.pairs = selected_pairs[:TOP_N_PAIRS]
+    state.pairs = [p['symbol'] for p in vol_pairs[:TOP_N_PAIRS]]
     state.tick_sizes = {sym: valid_binance_pairs[sym] for sym in state.pairs}
 
-async def fetch_historical_klines(session: aiohttp.ClientSession, symbol: str, interval: str, limit: int = 500):
+async def fetch_historical_klines(session: aiohttp.ClientSession, symbol: str, interval: str, limit: int = 150):
+    # Límite reducido a 150: Suficiente para convergencia RSI, salva RAM y tiempo
     params = {'symbol': symbol, 'interval': interval, 'limit': limit}
     data = await fetch_json(session, f"{BASE_REST_URL}/api/v3/klines", params)
     df = pd.DataFrame(data, columns=['open_time', 'open', 'high', 'low', 'close', 'volume', 
                                      'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'])
-    df['close'] = df['close'].astype(float)
-    df['high'] = df['high'].astype(float)
-    df['low'] = df['low'].astype(float)
+    # Convertimos tipos críticos para Pandas
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df[col] = df[col].astype(float)
     return df
 
 async def sync_klines(session: aiohttp.ClientSession, interval: str, target_dict: dict, pairs_list: list):
-    state.activity_msg = f"[Sincronizando Velas Históricas {interval}...]"
+    state.activity_msg = f"[Sincronizando Velas Iniciales {interval}...]"
     chunk_size = 20
     for i in range(0, len(pairs_list), chunk_size):
         chunk = pairs_list[i:i+chunk_size]
@@ -157,7 +127,7 @@ async def sync_klines(session: aiohttp.ClientSession, interval: str, target_dict
         results = await asyncio.gather(*tasks)
         for sym, df in zip(chunk, results):
             target_dict[sym] = df
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.2) # Respetamos rate limit de Binance inicial
 
 # ==========================================
 # ANÁLISIS DE MICROESTRUCTURA (ORDER BOOK)
@@ -199,7 +169,7 @@ async def analyze_microstructure(session: aiohttp.ClientSession, symbol: str, si
     return formatted_price, max_vol
 
 # ==========================================
-# LÓGICA CORE DIRECTA (DIRECTIVAS ESTRICTAS + MEMORIA VISUAL)
+# LÓGICA CORE DIRECTA Y ESTRICTA
 # ==========================================
 async def evaluate_logic(session: aiohttp.ClientSession, symbol: str):
     df_1h = state.klines_1h.get(symbol)
@@ -221,7 +191,6 @@ async def evaluate_logic(session: aiohttp.ClientSession, symbol: str):
     if ind_5m[0] is None: return
     rsi_5m_s, upper_5m_s, lower_5m_s = ind_5m
         
-    # Extraemos valores actuales de la última vela (milisegundo actual) para la Interfaz
     rsi_1h_val = rsi_1h_s.iloc[-1]
     rsi_15m_val = rsi_15m_s.iloc[-1]
     rsi_5m_val = rsi_5m_s.iloc[-1]
@@ -230,15 +199,10 @@ async def evaluate_logic(session: aiohttp.ClientSession, symbol: str):
     lower_5m_val = lower_5m_s.iloc[-1]
     current_price = df_5m['close'].iloc[-1]
 
-    # --- DIRECTIVAS MACRO (1H + 15m) CON MEMORIA DE ESTRUCTURA ---
-    # El trader ve la "zona" de sobrecompra/sobreventa basada en el movimiento reciente.
-    # Si exigimos que el milisegundo actual tenga RSI extremo, perdemos la entrada si el RSI ya empezó a rebotar.
-    
-    # 1H: Buscamos si en las últimas 3 velas (3 horas) cruzó la banda y tuvo RSI extremo
+    # --- DIRECTIVAS MACRO (1H + 15m) CON MEMORIA CORTA ---
     long_1h = any((rsi_1h_s.iloc[-i] < 30 and df_1h['low'].iloc[-i] <= lower_1h_s.iloc[-i]) for i in range(1, 4) if len(df_1h) >= i)
     short_1h = any((rsi_1h_s.iloc[-i] > 70 and df_1h['high'].iloc[-i] >= upper_1h_s.iloc[-i]) for i in range(1, 4) if len(df_1h) >= i)
     
-    # 15m: Buscamos si en los últimas 4 velas (1 hora) cruzó la banda y tuvo RSI extremo
     long_15m = any((rsi_15m_s.iloc[-i] < 30 and df_15m['low'].iloc[-i] <= lower_15m_s.iloc[-i]) for i in range(1, 5) if len(df_15m) >= i)
     short_15m = any((rsi_15m_s.iloc[-i] > 70 and df_15m['high'].iloc[-i] >= upper_15m_s.iloc[-i]) for i in range(1, 5) if len(df_15m) >= i)
 
@@ -266,22 +230,20 @@ async def evaluate_logic(session: aiohttp.ClientSession, symbol: str):
         bb_value_raw = 0.0
         
         if radar_info['side'] == 'LONG':
-            # Directiva 5m Long: RSI < 30 + Cruza Banda Inferior (Evaluamos vela actual y la anterior inmediata)
             if any((rsi_5m_s.iloc[-i] < 30 and df_5m['low'].iloc[-i] <= lower_5m_s.iloc[-i]) for i in range(1, 3) if len(df_5m) >= i):
                 trigger = True
                 ref_price = lower_5m_val
                 bb_value_raw = lower_5m_val
                 
         elif radar_info['side'] == 'SHORT':
-            # Directiva 5m Short: RSI > 70 + Cruza Banda Superior (Evaluamos vela actual y la anterior inmediata)
             if any((rsi_5m_s.iloc[-i] > 70 and df_5m['high'].iloc[-i] >= upper_5m_s.iloc[-i]) for i in range(1, 3) if len(df_5m) >= i):
                 trigger = True
                 ref_price = upper_5m_val
                 bb_value_raw = upper_5m_val
 
-        # Solo si se cumplen las 3 directivas, consultamos el libro de órdenes
         if trigger:
-            if symbol not in state.active_signals:
+            # Solo añadir si no existe o si ya estaba cerrado en histórico
+            if symbol not in state.active_signals or state.active_signals[symbol].get('closed', False):
                 entry_price, vol = await analyze_microstructure(session, symbol, radar_info['side'], ref_price)
                 state.active_signals[symbol] = {
                     'side': radar_info['side'],
@@ -290,15 +252,18 @@ async def evaluate_logic(session: aiohttp.ClientSession, symbol: str):
                     'wall_vol': vol,
                     'timestamp': time.time(),
                     'status': '¡GATILLO EN VIVO!',
-                    'pnl': 0.0
+                    'pnl': 0.0,
+                    'closed': False
                 }
-            else:
-                # Actualiza el timestamp si la entrada sigue siendo válida
-                state.active_signals[symbol]['timestamp'] = time.time()
 
-    # --- MOTOR PnL Y LIMPIEZA ---
-    to_delete = []
-    for sym, sig in state.active_signals.items():
+    # --- MOTOR PnL SIMÉTRICO Y REAL (TAKE PROFIT + STOP LOSS) ---
+    for sym, sig in list(state.active_signals.items()):
+        if sig.get('closed', False):
+            # Limpiar señales cerradas después de 30 segundos
+            if time.time() - sig.get('close_time', 0) > 30:
+                del state.active_signals[sym]
+            continue
+
         if sym not in state.klines_5m: continue
         
         curr_p = state.klines_5m[sym]['close'].iloc[-1]
@@ -311,9 +276,15 @@ async def evaluate_logic(session: aiohttp.ClientSession, symbol: str):
             
         sig['pnl'] = pnl_pct
 
-        # Stop Loss Dinámico o Cierre
+        # Reglas Claras de Salida
         if pnl_pct <= -1.5:
-            to_delete.append(sym)
+            sig['status'] = f"🛑 STOP LOSS [{pnl_pct:.2f}%]"
+            sig['closed'] = True
+            sig['close_time'] = time.time()
+        elif pnl_pct >= 1.5:
+            sig['status'] = f"🏆 TAKE PROFIT [{pnl_pct:.2f}%]"
+            sig['closed'] = True
+            sig['close_time'] = time.time()
         elif pnl_pct >= 0.2:
             sig['status'] = f"✅ +{pnl_pct:.2f}%"
         elif pnl_pct < 0:
@@ -321,93 +292,84 @@ async def evaluate_logic(session: aiohttp.ClientSession, symbol: str):
         else:
             sig['status'] = f"🔄 +{pnl_pct:.2f}%"
 
-    for sym in to_delete:
-        del state.active_signals[sym]
-
 # ==========================================
 # WEBSOCKETS & BACKGROUND TASKS
 # ==========================================
 async def ws_multiplex_listener(session: aiohttp.ClientSession):
+    """Suscripción nativa a WebSockets de Binance evitando Rate Limits REST."""
     while True:
-        # Solo necesitamos el stream de 5 minutos, la lógica es limpia
-        streams = "/".join([f"{sym.lower()}@kline_5m" for sym in state.pairs])
-        ws_url = f"{BASE_WS_URL}{streams}"
-        
         try:
-            state.activity_msg = "[Conectando WebSockets Multiplexados (5m)...]"
-            async with session.ws_connect(ws_url) as ws:
+            state.activity_msg = "[Conectando WebSockets Maestros...]"
+            async with session.ws_connect(BASE_WS_URL) as ws:
                 state.ws_connection = ws  
                 state.activity_msg = "[Procesando Flujo de Datos HFT (Ticks)]"
+                
+                # Suscribimos 1h, 15m y 5m por chunks para no sobrecargar el payload
+                streams = []
+                for sym in state.pairs:
+                    s = sym.lower()
+                    streams.extend([f"{s}@kline_1h", f"{s}@kline_15m", f"{s}@kline_5m"])
+                
+                for i in range(0, len(streams), 50):
+                    payload = {
+                        "method": "SUBSCRIBE",
+                        "params": streams[i:i+50],
+                        "id": i
+                    }
+                    await ws.send_json(payload)
+                    await asyncio.sleep(0.1)
+
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         payload = json.loads(msg.data)
-                        data = payload['data']['k']
+                        if 'k' not in payload: continue # Omitimos ACKs
+                        
+                        data = payload['k']
                         symbol = data['s']
+                        interval = data['i']
+                        kline_start = data['t']
                         close_price = float(data['c'])
                         high_price = float(data['h'])
                         low_price = float(data['l'])
-                        is_closed = data['x']
                         
-                        if symbol in state.klines_5m:
-                            df = state.klines_5m[symbol]
-                            df.iloc[-1, df.columns.get_loc('close')] = close_price
-                            df.iloc[-1, df.columns.get_loc('high')] = high_price
-                            df.iloc[-1, df.columns.get_loc('low')] = low_price
-                            df.iloc[-1, df.columns.get_loc('open')] = float(data['o'])
-                            df.iloc[-1, df.columns.get_loc('volume')] = float(data['v'])
-                            
-                            if is_closed:
-                                new_row = df.iloc[-1].copy()
-                                df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True).tail(500)
-                                state.klines_5m[symbol] = df
-                            
-                            # --- INYECCIÓN HFT A MACRO ---
-                            # Mantiene las velas de 15m y 1H actualizadas milisegundo a milisegundo 
-                            # para que no te pierdas el cruce de bandas Macro
-                            if symbol in state.klines_15m:
-                                df_15 = state.klines_15m[symbol]
-                                df_15.iloc[-1, df_15.columns.get_loc('close')] = close_price
-                                if close_price > df_15.iloc[-1]['high']: df_15.iloc[-1, df_15.columns.get_loc('high')] = close_price
-                                if close_price < df_15.iloc[-1]['low']: df_15.iloc[-1, df_15.columns.get_loc('low')] = close_price
-                            
-                            if symbol in state.klines_1h:
-                                df_1h = state.klines_1h[symbol]
-                                df_1h.iloc[-1, df_1h.columns.get_loc('close')] = close_price
-                                if close_price > df_1h.iloc[-1]['high']: df_1h.iloc[-1, df_1h.columns.get_loc('high')] = close_price
-                                if close_price < df_1h.iloc[-1]['low']: df_1h.iloc[-1, df_1h.columns.get_loc('low')] = close_price
+                        # Determinar qué DataFrame actualizar
+                        if interval == '1h': target_dict = state.klines_1h
+                        elif interval == '15m': target_dict = state.klines_15m
+                        elif interval == '5m': target_dict = state.klines_5m
+                        else: continue
 
-                            asyncio.create_task(evaluate_logic(session, symbol))
+                        if symbol in target_dict:
+                            df = target_dict[symbol]
+                            last_start = df['open_time'].iloc[-1]
+                            
+                            if kline_start == last_start:
+                                # Actualizar vela en formación (Solución al repintado falso)
+                                df.iloc[-1, df.columns.get_loc('close')] = close_price
+                                df.iloc[-1, df.columns.get_loc('high')] = high_price
+                                df.iloc[-1, df.columns.get_loc('low')] = low_price
+                                df.iloc[-1, df.columns.get_loc('volume')] = float(data['v'])
+                            elif kline_start > last_start:
+                                # Crear nueva vela limpiamente
+                                new_row = df.iloc[-1].copy()
+                                new_row['open_time'] = kline_start
+                                new_row['open'] = float(data['o'])
+                                new_row['high'] = high_price
+                                new_row['low'] = low_price
+                                new_row['close'] = close_price
+                                new_row['volume'] = float(data['v'])
+                                df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True).tail(150)
+                                target_dict[symbol] = df
+                            
+                            # Throttle: Evaluar lógica máx 1 vez por segundo por par (Solución al ahogo de Event Loop)
+                            if interval == '5m': # Evaluamos solo con los pulsos veloces de 5m
+                                now = time.time()
+                                if now - state.last_eval.get(symbol, 0) > 1.0:
+                                    state.last_eval[symbol] = now
+                                    asyncio.create_task(evaluate_logic(session, symbol))
                                 
         except Exception as e:
-            state.activity_msg = f"[Reconectando WebSocket...]"
+            state.activity_msg = f"[Reconectando WebSocket: {str(e)}]"
             await asyncio.sleep(2)
-
-async def periodic_rest_updater(session: aiohttp.ClientSession):
-    while True:
-        await asyncio.sleep(15) 
-        state.activity_msg = "[Actualizando Estado Macro por REST...]"
-        await sync_klines(session, '1h', state.klines_1h, state.pairs)
-        await sync_klines(session, '15m', state.klines_15m, state.pairs)
-        
-        for sym in state.pairs:
-            await evaluate_logic(session, sym)
-        state.activity_msg = "[Procesando Flujo de Datos HFT (Ticks)]"
-
-async def periodic_pairs_updater(session: aiohttp.ClientSession):
-    while True:
-        await asyncio.sleep(900) 
-        old_pairs = set(state.pairs)
-        await initialize_pairs(session)
-        new_pairs = set(state.pairs)
-        
-        added_pairs = list(new_pairs - old_pairs)
-        if added_pairs:
-            state.activity_msg = f"[Nuevos pares detectados. Sincronizando...]"
-            await sync_klines(session, '1h', state.klines_1h, added_pairs)
-            await sync_klines(session, '15m', state.klines_15m, added_pairs)
-            await sync_klines(session, '5m', state.klines_5m, added_pairs)
-            if state.ws_connection and not state.ws_connection.closed:
-                await state.ws_connection.close()
 
 # ==========================================
 # INTERFAZ GRÁFICA (RICH UI)
@@ -455,22 +417,18 @@ def generate_ui() -> Layout:
     signals_table.add_column("MURO LIQ.", justify="right", style="magenta")
     signals_table.add_column("ESTADO / PnL", justify="center", style="bold") 
 
-    current_t = time.time()
-    # Limpiador de señales viejas (1 hora en pantalla)
-    to_delete = [sym for sym, data in state.active_signals.items() if current_t - data['timestamp'] > 3600]
-    for sym in to_delete:
-        del state.active_signals[sym]
-
     for sym, data in state.active_signals.items():
         side_color = "bold green" if data['side'] == 'LONG' else "bold red"
         
-        pnl = data.get('pnl', 0.0)
-        
-        if "GATILLO" in data['status']:
+        if "TAKE PROFIT" in data['status']:
+            status_style = "bold blink yellow"
+        elif "STOP LOSS" in data['status']:
+            status_style = "bold blink red"
+        elif "GATILLO" in data['status']:
             status_style = "bold blink magenta"
-        elif pnl >= 0.2:
+        elif data.get('pnl', 0) >= 0.2:
             status_style = "bold green"
-        elif pnl < 0:
+        elif data.get('pnl', 0) < 0:
             status_style = "bold red"
         else:
             status_style = "bold cyan"
@@ -495,7 +453,7 @@ def generate_ui() -> Layout:
 # BOOTSTRAP Y LOOP PRINCIPAL
 # ==========================================
 async def main():
-    connector = aiohttp.TCPConnector(limit=0)
+    connector = aiohttp.TCPConnector(limit=50) # Límite sano de sockets
     async with aiohttp.ClientSession(connector=connector) as session:
         await initialize_pairs(session)
         await sync_klines(session, '1h', state.klines_1h, state.pairs)
@@ -503,8 +461,6 @@ async def main():
         await sync_klines(session, '5m', state.klines_5m, state.pairs)
         
         ws_task = asyncio.create_task(ws_multiplex_listener(session))
-        rest_task = asyncio.create_task(periodic_rest_updater(session))
-        pairs_updater_task = asyncio.create_task(periodic_pairs_updater(session))
         
         with Live(generate_ui(), refresh_per_second=4, screen=True) as live:
             while True:
