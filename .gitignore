@@ -1,0 +1,12 @@
+.env
+.env.*
+*.pem
+*.key
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log
+.DS_Store
+config.json
+config_*.json
